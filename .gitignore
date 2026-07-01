@@ -5,3 +5,4 @@ __pycache__
 build.venv/
 benchmark/results/
 benchmark/smoke/
+benchmark/webapp/jobs/
