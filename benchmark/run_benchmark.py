@@ -245,7 +245,9 @@ def process_sample(client, args, sample, out_root):
     if os.path.exists(ckpt):
         with open(ckpt) as f:
             return json.load(f)
-    result = {"id": sid, "name": sample["name"], "type": sample["type"]}
+    # one CADBench sample lacks name/type; default type by split heuristic
+    result = {"id": sid, "name": sample.get("name", sid[:8]),
+              "type": sample.get("type", "Wild")}
     try:
         script = generate_script(client, args.model, sample["instruction"])
         with open(os.path.join(sdir, "script.py"), "w") as f:
@@ -259,7 +261,7 @@ def process_sample(client, args, sample, out_root):
                 f.write(out[-8000:])
             result.update(syntax_error=True,
                           scores={d: 0.0 for d in DIMENSIONS})
-            log(f"  [{sample['name']}] SYNTAX ERROR")
+            log(f"  [{result['name']}] SYNTAX ERROR")
             with open(ckpt, "w") as f:
                 json.dump(result, f)
             return result
@@ -270,7 +272,7 @@ def process_sample(client, args, sample, out_root):
         if not views:
             result.update(render_failed=True,
                           scores={d: 0.0 for d in DIMENSIONS})
-            log(f"  [{sample['name']}] RENDER FAILED")
+            log(f"  [{result['name']}] RENDER FAILED")
             with open(ckpt, "w") as f:
                 json.dump(result, f)
             return result
@@ -281,12 +283,12 @@ def process_sample(client, args, sample, out_root):
             scores.setdefault(d, 1.0)
         result["scores"] = scores
         result["verdicts"] = verdicts
-        log(f"  [{sample['name']}] "
+        log(f"  [{result['name']}] "
             + " ".join(f"{d.split()[0]}={scores[d]:.2f}" for d in DIMENSIONS))
     except Exception as e:
         result.update(error=str(e), syntax_error=True,
                       scores={d: 0.0 for d in DIMENSIONS})
-        log(f"  [{sample['name']}] ERROR: {e}")
+        log(f"  [{result['name']}] ERROR: {e}")
     with open(ckpt, "w") as f:
         json.dump(result, f)
     return result
