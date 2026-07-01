@@ -2,4 +2,6 @@ __pycache__
 .idea
 .DS_Store
 *.egg-info
-build
+build.venv/
+benchmark/results/
+benchmark/smoke/
