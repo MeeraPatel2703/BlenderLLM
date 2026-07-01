@@ -1,6 +1,7 @@
 """Job pipeline: text spec -> fable FreeCAD script -> STEP -> obj + DXF
 -> preview PNGs. Each stage updates job['status'] for the frontend poller.
 """
+import json
 import os
 import re
 import subprocess
@@ -14,8 +15,12 @@ import anthropic
 
 FREECADCMD = "/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd"
 BLENDER = "/Applications/Blender.app/Contents/MacOS/Blender"
+PALMETTO = os.path.expanduser("~/Palmetto/core/.build/bin/palmetto_engine")
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = "claude-fable-5"
+
+with open(os.path.join(HERE, "draftaid_prompt.md")) as _f:
+    DRAFTAID_SYSTEM = _f.read()
 
 SYSTEM = (
     "You are an expert in FreeCAD's Python API (the Part workbench). Write a "
@@ -79,15 +84,40 @@ def run_pipeline(job, jobdir, spec):
         ))
     job["script"] = script
 
-    job["status"] = "Generating drawing views and mesh..."
+    job["status"] = "Probing geometry (FreeCAD)..."
     env = dict(os.environ, FC_STEP=step_path, FC_OUT=jobdir)
-    ok, out = _run([FREECADCMD, os.path.join(HERE, "fc_post.py")],
+    ok, out = _run([FREECADCMD, os.path.join(HERE, "fc_geom.py")],
                    jobdir, env=env)
-    if not ok or "FC_POST_OK" not in out:
+    if not ok or "FC_GEOM_OK" not in out:
+        raise RuntimeError("Geometry probe failed:\n" + out[-1200:])
+    with open(os.path.join(jobdir, "geometry.json")) as f:
+        geom = json.load(f)
+    job["bbox"] = [round(geom["bbox_max"][i] - geom["bbox_min"][i], 2)
+                   for i in range(3)]
+
+    job["status"] = "Recognizing features (Palmetto)..."
+    features = _palmetto_features(step_path, jobdir)
+    geom["recognized_features"] = features
+    job["features"] = _feature_summary(geom)
+
+    job["status"] = "Fable is planning the dimension scheme..."
+    plan = _plan_dimensions(client, spec, geom)
+    plan_path = os.path.join(jobdir, "plan.json")
+    with open(plan_path, "w") as f:
+        json.dump(plan, f, indent=1)
+    job["plan"] = plan
+
+    job["status"] = "Placing dimensions (TechDraw)..."
+    env = dict(os.environ, FC_STEP=step_path, FC_OUT=jobdir,
+               FC_PLAN=plan_path)
+    ok, out = _run([FREECADCMD, os.path.join(HERE, "fc_draw.py")],
+                   jobdir, env=env)
+    if not ok or "FC_DRAW_OK" not in out:
         raise RuntimeError("Drawing generation failed:\n" + out[-1200:])
-    m = re.search(r"FC_POST_OK bbox ([\d.]+) ([\d.]+) ([\d.]+)", out)
-    if m:
-        job["bbox"] = [round(float(x), 2) for x in m.groups()]
+    skipped = [ln for ln in out.splitlines()
+               if "skipped" in ln or "not placed" in ln]
+    if skipped:
+        job["warnings"] = skipped
 
     job["status"] = "Rendering 3D preview..."
     rpath = os.path.join(jobdir, "render.py")
@@ -104,6 +134,56 @@ def run_pipeline(job, jobdir, spec):
     _render_dxf(os.path.join(jobdir, "drawing.dxf"),
                 os.path.join(jobdir, "drawing.png"))
     job["status"] = "done"
+
+
+def _palmetto_features(step_path, jobdir):
+    """Run Palmetto feature recognition; empty list if unavailable."""
+    if not os.path.exists(PALMETTO):
+        return []
+    pdir = os.path.join(jobdir, "palmetto")
+    os.makedirs(pdir, exist_ok=True)
+    ok, _ = _run([PALMETTO, "--input", step_path, "--outdir", pdir,
+                  "--modules", "all"], jobdir, timeout=180)
+    fpath = os.path.join(pdir, "features.json")
+    if not os.path.exists(fpath):
+        return []
+    with open(fpath) as f:
+        data = json.load(f)
+    feats = data if isinstance(data, list) else data.get("features", [])
+    return [
+        {"id": ft["id"], "type": ft["type"], "subtype": ft.get("subtype"),
+         "params": ft.get("params", {}),
+         "confidence": ft.get("confidence")}
+        for ft in feats
+    ]
+
+
+def _feature_summary(geom):
+    from collections import Counter
+    parts = []
+    holes = Counter((h["diameter"], tuple(h["axis"]))
+                    for h in geom["holes"])
+    for (dia, _axis), n in sorted(holes.items()):
+        parts.append(f"{n}× ⌀{dia}" if n > 1 else f"⌀{dia}")
+    for ft in geom.get("recognized_features", []):
+        if ft["type"] == "fillet":
+            parts.append(f"fillet R{ft['params'].get('radius_mm')}")
+    return ", ".join(parts) if parts else "no features recognized"
+
+
+def _plan_dimensions(client, spec, geom):
+    user = (
+        f"Design intent (user's request): {spec}\n\n"
+        f"Part data:\n{json.dumps(geom, indent=1)}"
+    )
+    resp = client.messages.create(
+        model=MODEL, max_tokens=8000, system=DRAFTAID_SYSTEM,
+        messages=[{"role": "user", "content": user}])
+    text = response_text(resp)
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise RuntimeError("planner returned no JSON")
+    return json.loads(m.group(0))
 
 
 def _ask(client, prompt):

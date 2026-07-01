@@ -115,6 +115,8 @@
       </div>
     </div>
     <div class="meta" id="meta"></div>
+    <div class="meta" id="warnings" style="color:#b8860b"></div>
+    <details><summary>dimension plan (fable as drafter)</summary><pre id="plan"></pre></details>
     <details><summary>generated FreeCAD script</summary><pre id="script"></pre></details>
   </div>
 </div>
@@ -152,9 +154,14 @@ $('go').onclick = async () => {
         $('dl-step').href = `/jobs/${id}/part.step`;
         $('dl-dxf').href = `/jobs/${id}/drawing.dxf`;
         $('script').textContent = job.script || '';
-        $('meta').textContent = job.bbox
+        $('plan').textContent = job.plan
+          ? JSON.stringify(job.plan, null, 2) : 'no plan';
+        let meta = job.bbox
           ? `bounding box: ${job.bbox[0]} × ${job.bbox[1]} × ${job.bbox[2]} mm`
           : '';
+        if (job.features) meta += `   |   features: ${job.features}`;
+        $('meta').textContent = meta;
+        $('warnings').textContent = (job.warnings || []).join('\n');
         $('results').classList.add('show');
         break;
       }
