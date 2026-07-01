@@ -68,14 +68,28 @@ def extract_code(text):
     return text
 
 
+def api_call_with_retry(fn, attempts=4):
+    import time
+    for i in range(attempts):
+        try:
+            return fn()
+        except (anthropic.APIStatusError, anthropic.APIConnectionError,
+                json.JSONDecodeError, AttributeError):
+            if i == attempts - 1:
+                raise
+            time.sleep(15 * (i + 1))
+
+
 def generate_script(client, model, instruction):
-    resp = client.messages.create(
-        model=model,
-        max_tokens=16000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": instruction}],
-    )
-    return extract_code(response_text(resp))
+    def call():
+        resp = client.messages.create(
+            model=model,
+            max_tokens=16000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": instruction}],
+        )
+        return extract_code(response_text(resp))
+    return api_call_with_retry(call)
 
 
 def run_blender(blender, body, timeout=240):
@@ -205,15 +219,17 @@ def judge_sample(client, judge_model, sample, script, views):
             'Return JSON only, e.g. {"0": true, "1": false, ...}'
         ),
     })
-    resp = client.messages.create(
-        model=judge_model,
-        max_tokens=2048,
-        system=JUDGE_SYSTEM,
-        messages=[{"role": "user", "content": content}],
-    )
-    text = response_text(resp)
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    verdicts = json.loads(m.group(0))
+    def call():
+        resp = client.messages.create(
+            model=judge_model,
+            max_tokens=2048,
+            system=JUDGE_SYSTEM,
+            messages=[{"role": "user", "content": content}],
+        )
+        text = response_text(resp)
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        return json.loads(m.group(0))
+    verdicts = api_call_with_retry(call)
     per_dim = {}
     for i, (_, dim, _) in enumerate(flat):
         per_dim.setdefault(dim, []).append(bool(verdicts.get(str(i), False)))
@@ -224,6 +240,11 @@ def process_sample(client, args, sample, out_root):
     sid = sample["id"]
     sdir = os.path.join(out_root, sid)
     os.makedirs(sdir, exist_ok=True)
+    # resume: skip samples already scored in a previous run
+    ckpt = os.path.join(sdir, "result.json")
+    if os.path.exists(ckpt):
+        with open(ckpt) as f:
+            return json.load(f)
     result = {"id": sid, "name": sample["name"], "type": sample["type"]}
     try:
         script = generate_script(client, args.model, sample["instruction"])
@@ -239,6 +260,8 @@ def process_sample(client, args, sample, out_root):
             result.update(syntax_error=True,
                           scores={d: 0.0 for d in DIMENSIONS})
             log(f"  [{sample['name']}] SYNTAX ERROR")
+            with open(ckpt, "w") as f:
+                json.dump(result, f)
             return result
         result["syntax_error"] = False
 
@@ -248,6 +271,8 @@ def process_sample(client, args, sample, out_root):
             result.update(render_failed=True,
                           scores={d: 0.0 for d in DIMENSIONS})
             log(f"  [{sample['name']}] RENDER FAILED")
+            with open(ckpt, "w") as f:
+                json.dump(result, f)
             return result
 
         scores, verdicts = judge_sample(client, args.judge_model, sample,
@@ -262,6 +287,8 @@ def process_sample(client, args, sample, out_root):
         result.update(error=str(e), syntax_error=True,
                       scores={d: 0.0 for d in DIMENSIONS})
         log(f"  [{sample['name']}] ERROR: {e}")
+    with open(ckpt, "w") as f:
+        json.dump(result, f)
     return result
 
 
