@@ -99,6 +99,12 @@ def run_blender(blender, body, timeout=240):
 
 PREAMBLE = (
     "import bpy\nimport os\nimport math\n"
+    # compat shim: use_auto_smooth was removed in Blender 4.1, but models
+    # trained on older bpy still set it; accept it as a no-op like the
+    # paper's eval environment did
+    "if not hasattr(bpy.types.Mesh, 'use_auto_smooth'):\n"
+    "    bpy.types.Mesh.use_auto_smooth = bpy.props.BoolProperty(default=True)\n"
+    "    bpy.types.Mesh.auto_smooth_angle = bpy.props.FloatProperty(default=0.523599)\n"
     "bpy.ops.object.select_all(action='SELECT')\nbpy.ops.object.delete()\n"
 )
 
