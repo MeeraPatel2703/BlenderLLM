@@ -55,6 +55,93 @@ bpy.ops.render.render(write_still=True)
 """
 
 
+OLLAMA_MODEL = "hf.co/mradermacher/BlenderLLM-GGUF:Q3_K_M"
+BPY_SYSTEM = (
+    "You are an expert in using bpy script to create 3D models. Based on the "
+    "following instruction, your task is to write the corresponding bpy "
+    "script that will generate the desired 3D model in Blender. Please pay "
+    "close attention to every detail in the script and ensure it fully "
+    "adheres to the provided specifications."
+)
+
+
+def run_pipeline_blenderllm(job, jobdir, spec):
+    """BlenderLLM (local 7B via ollama): bpy script -> Blender -> render.
+    No DraftAid stage: it outputs meshes, so the drawing gets extent dims
+    from the mesh-derived solid only.
+    """
+    import urllib.request
+
+    job["status"] = "BlenderLLM (local 7B) is writing the bpy script..."
+    body = json.dumps({
+        "model": OLLAMA_MODEL, "stream": False,
+        "options": {"num_predict": 1024},
+        "messages": [{"role": "system", "content": BPY_SYSTEM},
+                     {"role": "user", "content": spec}],
+    }).encode()
+    req = urllib.request.Request(
+        "http://localhost:11434/api/chat", data=body,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        script = extract_code(
+            json.loads(r.read())["message"]["content"])
+    job["script"] = script
+
+    job["status"] = "Executing bpy script in Blender..."
+    obj_path = os.path.join(jobdir, "model.obj")
+    preamble = (
+        "import bpy\nimport os\nimport math\n"
+        "if not hasattr(bpy.types.Mesh, 'use_auto_smooth'):\n"
+        "    bpy.types.Mesh.use_auto_smooth = bpy.props.BoolProperty(default=True)\n"
+        "    bpy.types.Mesh.auto_smooth_angle = bpy.props.FloatProperty(default=0.523599)\n"
+        "bpy.ops.object.select_all(action='SELECT')\nbpy.ops.object.delete()\n"
+    )
+    bpath = os.path.join(jobdir, "bpy_script.py")
+    with open(bpath, "w") as f:
+        f.write(preamble + script +
+                f"\nbpy.ops.wm.obj_export(filepath=r'{obj_path}')\n")
+    ok, out = _run([BLENDER, "--background", "--factory-startup",
+                    "--python-exit-code", "1", "--python", bpath], jobdir)
+    if not ok or not os.path.exists(obj_path):
+        raise RuntimeError("bpy script failed (this counts as a syntax "
+                           "error in CADBench):\n" + out[-1200:])
+
+    job["status"] = "Rendering 3D preview..."
+    _render_obj(jobdir, obj_path)
+
+    job["status"] = "Drawing (extent dims only - mesh input)..."
+    try:
+        _mesh_drawing(jobdir, obj_path)
+        _render_dxf(os.path.join(jobdir, "drawing.dxf"),
+                    os.path.join(jobdir, "drawing.png"))
+    except Exception as e:
+        job["warnings"] = [f"drawing failed on mesh input: {e}"]
+    job["status"] = "done"
+
+
+def _render_obj(jobdir, obj_path):
+    rpath = os.path.join(jobdir, "render.py")
+    with open(rpath, "w") as f:
+        f.write(RENDER_TEMPLATE.format(
+            obj=obj_path, png=os.path.join(jobdir, "solid.png")))
+    ok, out = _run([BLENDER, "--background", "--factory-startup",
+                    "--python-exit-code", "1", "--python", rpath], jobdir)
+    if not ok:
+        raise RuntimeError("3D render failed:\n" + out[-800:])
+
+
+def _mesh_drawing(jobdir, obj_path):
+    """Mesh -> solid -> extent-dim drawing via the benchmark converter."""
+    conv = os.path.join(HERE, "..", "mesh_to_drawing.py")
+    env = dict(os.environ, FC_OBJ=obj_path,
+               FC_NAME="drawing_tmp", FC_OUT=jobdir)
+    ok, out = _run([FREECADCMD, conv], jobdir, env=env)
+    src = os.path.join(jobdir, "drawing_tmp_drawing.dxf")
+    if not ok or not os.path.exists(src):
+        raise RuntimeError(out[-400:])
+    os.rename(src, os.path.join(jobdir, "drawing.dxf"))
+
+
 def run_pipeline(job, jobdir, spec):
     client = anthropic.Anthropic()
     step_path = os.path.join(jobdir, "part.step")
@@ -120,15 +207,7 @@ def run_pipeline(job, jobdir, spec):
         job["warnings"] = skipped
 
     job["status"] = "Rendering 3D preview..."
-    rpath = os.path.join(jobdir, "render.py")
-    with open(rpath, "w") as f:
-        f.write(RENDER_TEMPLATE.format(
-            obj=os.path.join(jobdir, "model.obj"),
-            png=os.path.join(jobdir, "solid.png")))
-    ok, out = _run([BLENDER, "--background", "--factory-startup",
-                    "--python-exit-code", "1", "--python", rpath], jobdir)
-    if not ok:
-        raise RuntimeError("3D render failed:\n" + out[-800:])
+    _render_obj(jobdir, os.path.join(jobdir, "model.obj"))
 
     job["status"] = "Rendering the drawing..."
     _render_dxf(os.path.join(jobdir, "drawing.dxf"),

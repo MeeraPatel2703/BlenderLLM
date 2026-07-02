@@ -11,7 +11,7 @@ import uuid
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from pipeline import run_pipeline
+from pipeline import run_pipeline, run_pipeline_blenderllm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(HERE, "jobs")
@@ -29,17 +29,21 @@ def index():
 @app.post("/api/generate")
 def generate():
     spec = (request.json or {}).get("spec", "").strip()
+    model = (request.json or {}).get("model", "fable")
     if not spec:
         return jsonify({"error": "empty spec"}), 400
     job_id = uuid.uuid4().hex[:12]
     jobdir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(jobdir)
-    job = {"id": job_id, "status": "queued", "spec": spec}
+    job = {"id": job_id, "status": "queued", "spec": spec, "model": model}
     jobs[job_id] = job
 
     def work():
         try:
-            run_pipeline(job, jobdir, spec)
+            if model == "blenderllm":
+                run_pipeline_blenderllm(job, jobdir, spec)
+            else:
+                run_pipeline(job, jobdir, spec)
         except Exception as e:
             traceback.print_exc()
             job["error"] = str(e)
